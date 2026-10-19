@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rocksdb-native-opfs smoke test</title>
+<style>
+  :root { --bg: #fff; --fg: #1a1a1a; --muted: #666; --ok: #1a7f37; --bad: #c62828; color-scheme: light; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161616; --fg: #eee; --muted: #999; --ok: #4ade80; --bad: #f87171; color-scheme: dark; } }
+  body { font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  .muted { color: var(--muted); }
+  li { margin: .3rem 0; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .skip { color: var(--muted); }
+  pre { white-space: pre-wrap; font-size: 12px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>rocksdb-native-opfs: browser smoke test</h1>
+<p class="muted" id="env">Starting a dedicated worker…</p>
+<ul id="results"></ul>
+<p id="summary"></p>
+<script>
+  const list = document.getElementById('results')
+  const worker = new Worker('smoke.bundle.js')
+  worker.onmessage = ({ data }) => {
+    if (data.type === 'start') document.getElementById('env').textContent = data.userAgent
+    if (data.type === 'result') {
+      const li = document.createElement('li')
+      const mark = data.skipped ? '<span class="skip">–</span>' : `<span class="${data.ok ? 'ok' : 'bad'}">${data.ok ? '✓' : '✗'}</span>`
+      li.innerHTML = `${mark} ${data.name} <span class="muted">${data.skipped ? '(skipped)' : `(${data.ms} ms)`}</span>`
+      const detail = data.error || (data.skipped && data.reason)
+      if (detail) { const pre = document.createElement('pre'); pre.textContent = detail; li.appendChild(pre) }
+      list.appendChild(li)
+      console.log(data.skipped ? 'skip' : data.ok ? 'ok' : 'not ok', '-', data.name, data.error || data.reason || '')
+    }
+    if (data.type === 'done') {
+      const s = document.getElementById('summary')
+      s.className = data.failed ? 'bad' : 'ok'
+      const skipped = data.skipped ? `, ${data.skipped} skipped` : ''
+      s.textContent = data.failed ? `${data.failed} failed, ${data.passed} passed${skipped}` : `All ${data.passed} checks passed${skipped}`
+      console.log('# done', JSON.stringify(data))
+    }
+  }
+  worker.onerror = (e) => { document.getElementById('summary').textContent = 'Worker error: ' + e.message }
+</script>
+</body>
+</html>
