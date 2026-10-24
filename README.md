@@ -51,7 +51,7 @@ OPFS (browser) or opfs-node/ (Node, for tests)
 
 **1. Run the storage stack in a dedicated Web Worker.** OPFS's synchronous file handles only exist there.
 
-**2. Apply these bundler substitutions.** `scripts/aliases.js` has them as an esbuild plugin; the same table works with browserify or any other bundler.
+**2. Apply these bundler substitutions.** `scripts/aliases.js` has them as an esbuild plugin. for browserify theres `scripts/browserify-aliases.js`, a global transform (`browserify -g rocksdb-native-opfs/scripts/browserify-aliases.js worker.js`). `-r` or a "browser" map dont work here btw, they never reach rocksdb-native's own `require('../binding')`. the transform also handles package.json "exports" subpaths, browserify 17 cant find those on its own (hypercore-storage needs `hyperschema/runtime`).
 
 | Module | Replace with |
 | --- | --- |
@@ -59,13 +59,17 @@ OPFS (browser) or opfs-node/ (Node, for tests)
 | `fs` | `rocksdb-native-opfs/browser/fs.js` |
 | `device-file` | `rocksdb-native-opfs/browser/device-file.js` |
 | `path` | `path-browserify` |
-| `Buffer`, `process` globals | `buffer`, `process` (see `browser/globals.js`) |
+| `Buffer`, `process` globals | `buffer`, `process` (see `browser/globals.js`, it also puts `process` on globalThis cuz corestore's which-runtime reads `global.process`. browserify only gives each module a local `process`, so with browserify do `globalThis.process = process` at the top of the worker) |
 
 **3. Add the browser packages any Holepunch browser build needs anyway:** `events`, `buffer`, `process`, `path-browserify`, and `sodium-javascript` (sodium-universal maps to it in browsers but doesn't install it).
 
 **4. Consider asking for persistent storage** (`navigator.storage.persist()`). Otherwise the browser may evict OPFS data under storage pressure.
 
 Store paths are ordinary path strings, interpreted as directories under the OPFS root (`'datweb/corestore'` and so on).
+
+## Demo
+
+`npm run demo` serves `demo/` with budo. two corestores on opfs in a worker, `a` makes a core and `b` replicates it. reload the page (or restart the browser) and both still have the data, then one more block gets replicated. `?reset` starts over. replication needs `crypto_scalarmult_ed25519_noclamp` which sodium-javascript doesnt have, so the demo adds it from `libsodium-wrappers-sumo` for now
 
 ## Running the tests
 
@@ -124,7 +128,8 @@ index.js                 the binding (29 functions)
 lib/                     engine, log format, tree, file sharing
 opfs-node/               strict OPFS shim for Node
 browser/                 stand-ins for the browser build (fs, device-file, test-tmp, globals)
-scripts/                 fetch-upstream, bundler aliases, browser test build
+scripts/                 fetch-upstream, bundler aliases (esbuild, browserify), browser test build
+demo/                    corestore replication + reload demo (budo)
 browser-test/            smoke test page and worker script
 test/                    own tests, fuzzer, harness, skip list
 BINDING.md               the binding contract

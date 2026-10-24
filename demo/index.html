@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rocksdb-native-opfs demo</title>
+<p>Two corestores on OPFS, <code>a</code> and <code>b</code>, in a dedicated worker. The first visit makes a core on <code>a</code> with 10 blocks and replicates it to <code>b</code>. Reload the page (or restart the browser): both still have the data, <code>b</code> reads it without replicating, then <code>a</code> appends one more block and <code>b</code> gets it. <a href="?reset">start over</a></p>
+<pre id="out"></pre>
+<script>
+  const out = document.getElementById('out')
+  const worker = new Worker('worker.bundle.js' + location.search)
+  window.results = []
+  worker.onmessage = (e) => {
+    window.results.push(e.data)
+    out.textContent += `${e.data.type}  ${e.data.what}${e.data.error ? '\n' + e.data.error : ''}\n`
+  }
+  worker.onerror = (e) => {
+    window.results.push({ type: 'not ok', what: 'worker error', error: e.message })
+    out.textContent += `not ok  worker error\n${e.message}\n`
+  }
+</script>
