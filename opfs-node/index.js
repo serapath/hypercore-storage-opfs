@@ -25,18 +25,19 @@
 //   - Locks are per Node thread. Real OPFS locks are origin-wide, across all
 //     tabs and workers.
 //   - Storage quota and eviction.
-//   - getFile() while a sync access handle is open: browsers differ, so the shim
-//     refuses it (NoModificationAllowedError). Code that passes here won't
-//     depend on it.
-//   - createWritable() and move() are not implemented.
+//   - Quota/eviction and origin-wide Web Locks across independent Node workers.
+//   - move() is not implemented. The project engine intentionally uses
+//     createWritable() and getFile(), both modelled below.
 
 const fs = require('fs')
 const path = require('path')
 const { isMainThread } = require('worker_threads')
 
-// Every storage created by this module shares one lock table per thread,
-// mirroring how OPFS locks are shared by everything in an origin.
+// The test shim also models sync handles for API-specific tests, but the
+// rocksdb-native-opfs engine must not call createSyncAccessHandle().
+// File locks are per Node thread; real OPFS/Web Locks coordinate by origin.
 const locks = new Map() // absolute file path -> open FileSystemSyncAccessHandle
+const writers = new Map() // absolute file path -> open FileSystemWritableFileStream
 
 function domError(name, message) {
   return new DOMException(message, name)
@@ -62,6 +63,9 @@ function statOrNull(p) {
 function isLockedWithin(dirPath) {
   const prefix = dirPath + path.sep
   for (const p of locks.keys()) {
+    if (p.startsWith(prefix)) return true
+  }
+  for (const p of writers.keys()) {
     if (p.startsWith(prefix)) return true
   }
   return false
@@ -148,8 +152,8 @@ class FileSystemDirectoryHandle extends FileSystemHandle {
       return
     }
 
-    if (locks.has(p)) {
-      throw domError('NoModificationAllowedError', 'The file is locked by an open access handle.')
+    if (locks.has(p) || writers.has(p)) {
+      throw domError('NoModificationAllowedError', 'The file is locked by an open access handle or writable stream.')
     }
     fs.unlinkSync(p)
   }
@@ -192,13 +196,32 @@ class FileSystemFileHandle extends FileSystemHandle {
   }
 
   async getFile() {
+    // createWritable() edits a staging file and publishes it only on close, so
+    // getFile() can safely snapshot the currently committed target while a
+    // writable stream is open. Sync access handles are exclusive and block it.
     if (locks.has(this._path)) {
       throw domError('NoModificationAllowedError', 'opfs-node refuses getFile() while a sync access handle is open.')
     }
     if (!statOrNull(this._path)) {
       throw domError('NotFoundError', 'A requested file or directory could not be found.')
     }
-    return new File([fs.readFileSync(this._path)], this.name)
+    return new File([await fs.promises.readFile(this._path)], this.name)
+  }
+
+  async createWritable({ keepExistingData = false } = {}) {
+    if (locks.has(this._path) || writers.has(this._path)) {
+      throw domError('NoModificationAllowedError', 'A file access handle or writable stream is already open.')
+    }
+    if (!statOrNull(this._path)) {
+      throw domError('NotFoundError', 'A requested file or directory could not be found.')
+    }
+
+    const tempPath = this._path + '.opfs-tmp-' + Math.random().toString(16).slice(2)
+    if (keepExistingData) await fs.promises.copyFile(this._path, tempPath)
+    const fd = await fs.promises.open(tempPath, keepExistingData ? 'r+' : 'w+')
+    const stream = new FileSystemWritableFileStream(this._path, tempPath, fd, this._options)
+    writers.set(this._path, stream)
+    return stream
   }
 
   async createSyncAccessHandle() {
@@ -207,7 +230,7 @@ class FileSystemFileHandle extends FileSystemHandle {
     if (isMainThread) {
       throw new TypeError('createSyncAccessHandle is not a function (only available in dedicated workers)')
     }
-    if (locks.has(this._path)) {
+    if (locks.has(this._path) || writers.has(this._path)) {
       throw domError('NoModificationAllowedError', 'Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the file.')
     }
     if (!statOrNull(this._path)) {
@@ -218,10 +241,6 @@ class FileSystemFileHandle extends FileSystemHandle {
     const handle = new FileSystemSyncAccessHandle(this._path, fd, this._options)
     locks.set(this._path, handle)
     return handle
-  }
-
-  async createWritable() {
-    throw domError('NotSupportedError', 'opfs-node does not implement createWritable().')
   }
 
   async move() {
@@ -242,6 +261,91 @@ function toPosition(at) {
     throw new TypeError(`Value is outside the 'unsigned long long' value range: ${at}`)
   }
   return Math.floor(at)
+}
+
+class FileSystemWritableFileStream {
+  constructor(targetPath, tempPath, fileHandle, options) {
+    this._targetPath = targetPath
+    this._tempPath = tempPath
+    this._fd = fileHandle
+    this._options = options
+    this._position = 0
+    this._closed = false
+  }
+
+  _assertOpen() {
+    if (this._closed) throw domError('InvalidStateError', 'The writable stream is closed.')
+  }
+
+  async write(chunk) {
+    this._assertOpen()
+
+    if (chunk && typeof chunk === 'object' && chunk.type === 'seek') {
+      this._position = toPosition(chunk.position)
+      return
+    }
+    if (chunk && typeof chunk === 'object' && chunk.type === 'truncate') {
+      return this.truncate(chunk.size)
+    }
+
+    let data = chunk
+    if (chunk && typeof chunk === 'object' && chunk.type === 'write') {
+      data = chunk.data
+      if (chunk.position !== undefined) this._position = toPosition(chunk.position)
+    }
+
+    let view
+    if (typeof data === 'string') view = Buffer.from(data)
+    else if (data instanceof Blob) view = Buffer.from(await data.arrayBuffer())
+    else view = toView(data)
+
+    let total = 0
+    while (total < view.byteLength) {
+      const result = await this._fd.write(view, total, view.byteLength - total, this._position + total)
+      if (result.bytesWritten <= 0) throw new Error('Short write to OPFS shim file')
+      total += result.bytesWritten
+    }
+    this._position += total
+  }
+
+  async seek(position) {
+    this._assertOpen()
+    this._position = toPosition(position)
+  }
+
+  async truncate(size) {
+    this._assertOpen()
+    size = toPosition(size)
+    await this._fd.truncate(size)
+    if (this._position > size) this._position = size
+  }
+
+  async close() {
+    if (this._closed) return
+    this._closed = true
+    try {
+      if (this._options.fsync) await this._fd.sync()
+      await this._fd.close()
+      await fs.promises.rename(this._tempPath, this._targetPath)
+    } catch (err) {
+      try { await this._fd.close() } catch {}
+      try { await fs.promises.unlink(this._tempPath) } catch {}
+      throw err
+    } finally {
+      writers.delete(this._targetPath)
+    }
+  }
+
+  async abort() {
+    if (this._closed) return
+    this._closed = true
+    try {
+      await this._fd.close()
+    } finally {
+      writers.delete(this._targetPath)
+      try { await fs.promises.unlink(this._tempPath) } catch {}
+    }
+  }
 }
 
 class FileSystemSyncAccessHandle {
@@ -312,13 +416,68 @@ class FileSystemSyncAccessHandle {
   }
 }
 
+// Minimal Web Locks API model for Node tests. It handles same-thread shared
+// and exclusive locks; the real browser is responsible for cross-tab/worker
+// arbitration during the browser tests.
+class LockManager {
+  constructor() {
+    this._states = new Map()
+  }
+
+  request(name, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    }
+    options = options || {}
+
+    const state = this._states.get(name) || { active: [], queue: [] }
+    this._states.set(name, state)
+    const mode = options.mode || 'exclusive'
+    const canGrantNow = () => {
+      if (state.queue.length > 0) return false
+      if (state.active.some((entry) => entry.mode === 'exclusive')) return false
+      return mode === 'shared' || state.active.length === 0
+    }
+
+    if (options.ifAvailable && !canGrantNow()) {
+      return Promise.resolve().then(() => callback(null))
+    }
+
+    return new Promise((resolve, reject) => {
+      state.queue.push({ mode, callback, resolve, reject })
+      this._drain(name, state)
+    })
+  }
+
+  _drain(name, state) {
+    if (state.active.some((entry) => entry.mode === 'exclusive')) return
+    if (state.queue.length === 0) return
+
+    if (state.active.length > 0 && state.queue[0].mode !== 'shared') return
+
+    do {
+      const entry = state.queue.shift()
+      state.active.push(entry)
+      const lock = { name, mode: entry.mode }
+      Promise.resolve().then(() => entry.callback(lock)).then(entry.resolve, entry.reject).finally(() => {
+        const index = state.active.indexOf(entry)
+        if (index !== -1) state.active.splice(index, 1)
+        if (state.active.length === 0 && state.queue.length === 0) this._states.delete(name)
+        else this._drain(name, state)
+      })
+      if (entry.mode === 'exclusive') return
+    } while (state.queue.length > 0 && state.queue[0].mode === 'shared')
+  }
+}
+
 // Creates a StorageManager-like object whose getDirectory() returns the OPFS
 // root, backed by the `root` directory on disk.
 //
 // Options:
 //   root  - directory on disk that acts as the OPFS root (created if missing)
-//   fsync - make flush() call fsync. Off by default because it makes test runs
-//           slow and the durability being tested belongs to the browser anyway.
+//   fsync - when enabled, sync writable test streams before close. Off by default
+//           because it makes test runs slow; browser durability needs real-browser tests.
 function createStorageManager({ root, fsync = false } = {}) {
   if (!root) throw new Error('opfs-node: a root directory is required')
   const absolute = path.resolve(root)
@@ -354,13 +513,21 @@ function install(options) {
     enumerable: true,
     writable: true
   })
+  if (!globalThis.navigator.locks) {
+    Object.defineProperty(globalThis.navigator, 'locks', {
+      value: new LockManager(),
+      configurable: true,
+      enumerable: true,
+      writable: true
+    })
+  }
 
   return storage
 }
 
-// For tests: how many sync access handles are open in this thread right now.
+// For tests: how many sync handles and async writable streams are open right now.
 function openHandleCount() {
-  return locks.size
+  return locks.size + writers.size
 }
 
 module.exports = {
@@ -369,5 +536,7 @@ module.exports = {
   openHandleCount,
   FileSystemDirectoryHandle,
   FileSystemFileHandle,
-  FileSystemSyncAccessHandle
+  FileSystemSyncAccessHandle,
+  FileSystemWritableFileStream,
+  LockManager
 }

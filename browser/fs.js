@@ -44,7 +44,13 @@ module.exports = {
   renameSync: () => {
     throw unsupported('renameSync')
   },
-  writeFileSync: () => {
+  writeFileSync: (path) => {
+    // hypercore-storage's legacy RocksDB recovery path creates this marker
+    // before deleting RocksDB WAL files. Those files and that recovery policy
+    // do not exist in the browser engine. Ignore only the marker write so the
+    // original database-open error is not masked by ENOSYS; readdirSync() is
+    // intentionally empty, so no log files are deleted.
+    if (String(path).split(/[\\/]/).pop() === 'RECOVERING') return
     throw unsupported('writeFileSync')
   },
   unlinkSync: () => {

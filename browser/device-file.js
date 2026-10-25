@@ -1,12 +1,12 @@
 // Browser stand-in for `device-file`.
 //
-// In Node, hypercore-storage uses device-file to lock a CORESTORE file (so two
-// processes can't open one store) and to notice a store being copied between
-// machines. Neither applies to OPFS: the engine underneath already takes an
-// exclusive lock on the store (its LOCK file), and an OPFS store can't be
-// copied to another device.
+// In Node, hypercore-storage uses device-file to lock a CORESTORE file and
+// heuristically notice copies between machines. The browser implementation
+// creates fresh OPFS stores and populates them through replication, so import
+// identity checks are not needed. The database engine uses a Web Lock to
+// prevent concurrent writers for the same origin and store path.
 //
-// So this keeps device-file's interface and does nothing. `transfer()`
+// Keep device-file's interface without Node filesystem assumptions. `transfer()`
 // returns -1, which tells rocksdb-native there is no external lock.
 
 class DeviceFile {

@@ -32,6 +32,25 @@ function throwsWith(t, fn, name) {
   }
 }
 
+
+test('async writable stream publishes on close and preserves old snapshots', async (t) => {
+  const dir = await scratch()
+  const file = await dir.getFileHandle('async', { create: true })
+
+  const first_writer = await file.createWritable()
+  await first_writer.write(Buffer.from('first'))
+  const before_first_close = await file.getFile()
+  t.is(await before_first_close.text(), '')
+  await first_writer.close()
+  t.is(await (await file.getFile()).text(), 'first')
+
+  const second_writer = await file.createWritable()
+  await second_writer.write(Buffer.from('second'))
+  t.is(await (await file.getFile()).text(), 'first', 'unclosed changes are not published')
+  await second_writer.close()
+  t.is(await (await file.getFile()).text(), 'second')
+})
+
 test('sync access handles are refused on the main thread', (t) => {
   const script = `
     const opfs = require(${JSON.stringify(path.join(__dirname, '..', 'opfs-node'))})

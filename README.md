@@ -4,25 +4,18 @@ rocksdb-native's native binding, reimplemented in plain, commented JavaScript on
 
 rocksdb-native is two layers: a JavaScript layer (sessions, batches, iterators, snapshots, suspend/resume) and a native binding of 29 functions underneath. This project replaces only the binding, so rocksdb-native's own JavaScript, hypercore-storage and Hypercore all run unchanged on top.
 
-Status: a working first version, tested in Node against a strict OPFS shim. **It has not yet been run in a real browser** (none was available where it was built). See "Running the browser smoke test".
+Status: asynchronous OPFS implementation in progress. The runtime storage code uses `FileSystemWritableFileStream`, `FileSystemFileHandle.getFile()` and `Blob.arrayBuffer()`; it does not call `createSyncAccessHandle()`. The updated code and tests still need to be run against the full upstream suites and in real browsers before production use.
 
-## Results
+## Verification status
 
-All suites run unchanged from upstream, at pinned versions, in Node `worker_threads` against the strict OPFS shim.
+This async-only refactor is not yet production-validated. The uploaded baseline had prior test results for a synchronous implementation; those results do **not** apply to the current code.
 
-| Suite | Result |
-| --- | --- |
-| rocksdb-native 3.19.1 `test.js` | 78 pass, 6 skipped (reasons below) |
-| hypercore-storage 3.4.0 `test/` | 78 pass, 1 skipped by upstream itself (macOS-only fixture) |
-| Hypercore 11.39.0 `test/` | 423 pass, 9 skipped (8 by Hypercore itself, 1 here: see "Known limits") |
-| Differential fuzzing against native RocksDB | 2,000 sequences of 150 ops and 100 of 1,500 ops: no differences |
-| This project's own tests | 33 pass: tree, log format, shim strictness, crash recovery, locking, compaction |
-| Browser bundle, run in a browser-like Node worker | 6 pass, 1 skipped (replication: see "Known limits") |
+- Syntax checks have been run on the modified engine, binding, async OPFS shim and updated browser smoke test.
+- A standalone Node smoke test passed through the OPFS shim, covering reads/writes, snapshots and iterators, compaction/reopen, torn and corrupt tails, interrupted compaction, read-only file leases, a reader racing an in-flight commit, suspended-reader invalidation, and injected writable-close failure. The test harness was external to this repository, so this result is not a replacement for the committed test suites.
+- The full unit, upstream integration and differential-fuzz suites still need to be run against this refactor. Dependency installation did not complete in the editing environment.
+- The browser smoke test has been updated to exercise asynchronous OPFS, but it still needs to run in real Chrome, Firefox and Safari.
 
-Skipped rocksdb-native tests, with the full reasons in `test/skip-list.js`:
-
-- **4 fd-lock tests.** They hand RocksDB an OS file descriptor and check it gets closed. Browsers have no file descriptors; the store takes its own lock instead.
-- **2 manual-compaction tests.** They inspect RocksDB's LSM layout (SST files per level), or expect a key-count estimate that includes an old version kept for a snapshot. There are no levels here, and the count is exact.
+The upstream test skip list remains relevant to the original binding compatibility strategy, but no pass counts are claimed for this async refactor until the suites have actually been re-run.
 
 ## How it works
 
@@ -38,18 +31,18 @@ lib/files.js    shared OPFS file handles
 OPFS (browser) or opfs-node/ (Node, for tests)
 ```
 
-- **Writes.** Each write batch is appended to a log file as one record with a length and a CRC-32. On open, the log is replayed; a record that was only partly written fails its checksum and is discarded with everything after it. So every batch is all-or-nothing, and the store reopens exactly as it was after the last complete batch.
+- **Writes.** Each write batch is stored in a new immutable delta file as one checksummed record. A write is published to the in-memory index only after the asynchronous writable stream closes successfully. On open, complete batches are replayed; a torn or invalid tail is ignored. Browser stream close is the implementation's commit boundary, not a guarantee of survival under every possible hardware power-loss scenario.
 - **Index.** In memory, each column family is a persistent (copy-on-write) AVL tree mapping keys to where their values sit in the log. Values stay on disk and are read on demand.
 - **Snapshots and iterators.** A snapshot or iterator keeps the tree roots it started with, plus a reference on the log files they point into. Trees are never modified in place, so a view never changes.
-- **Compaction.** Compaction writes every live entry into a new "base" log file, marks the end with a `BASE_END` record, and switches to it. Old files are deleted once no view needs them. A base without `BASE_END` (an interrupted compaction) is ignored on open.
-- **Locking.** A writer holds an exclusive OPFS handle on the store's `LOCK` file, so a second writer (another tab, say) gets a clear error. Read-only opens take no lock.
+- **Compaction.** Compaction asynchronously writes every live entry into a new "base" log file, marks the end with `BASE_END`, closes the stream, then switches to it. Old files are retired only after no view or in-flight read needs them. A base without `BASE_END` (an interrupted compaction) is ignored on open.
+- **Locking.** A writable store holds an exclusive origin-scoped Web Lock for its lifetime, so another writer for the same origin/path is refused. Read-only opens don't take the writer lock, but hold shared Web Lock leases on the log files their views depend on. Compaction deletes an old file only if it can obtain the matching exclusive file lock; otherwise cleanup is deferred until a later writable open.
 - **Suspend/resume.** `suspend()` releases every OPFS handle. `resume()` refuses if another writer opened the store meanwhile, detected through a random `SESSION_ID`, as librocksdb does.
 
 `BINDING.md` documents exactly what each of the 29 functions does.
 
 ## Using it in a browser build (e.g. `datweb`)
 
-**1. Run the storage stack in a dedicated Web Worker.** OPFS's synchronous file handles only exist there.
+**1. Run the storage stack in a Web Worker.** This keeps indexing and compaction off the UI thread. The engine itself uses asynchronous OPFS APIs and does not require `FileSystemSyncAccessHandle`.
 
 **2. Apply these bundler substitutions.** `scripts/aliases.js` has them as an esbuild plugin. for browserify theres `scripts/browserify-aliases.js`, a global transform (`browserify -g rocksdb-native-opfs/scripts/browserify-aliases.js worker.js`). `-r` or a "browser" map dont work here btw, they never reach rocksdb-native's own `require('../binding')`. the transform also handles package.json "exports" subpaths, browserify 17 cant find those on its own (hypercore-storage needs `hyperschema/runtime`).
 
@@ -88,7 +81,7 @@ npm run test:bundle         # builds the browser bundle and runs it in a browser
 
 The fuzzer takes `--seeds N`, `--ops N` and `--seed N` (to reproduce one failure): `node test/run.js fuzz --seeds 2000`. On a difference it prints the shortest sequence of operations that still shows it.
 
-Every suite runs in a `worker_threads` worker because the OPFS shim, like browsers, refuses synchronous file handles on the main thread. `test/harness/aliases.js` redirects module resolution the same way a bundler alias would. Skips live in one file, `test/skip-list.js`, each with its reason; upstream test files are never edited.
+The unit and integration suites run in a `worker_threads` worker to isolate global state and model browser contexts. The engine's file I/O is asynchronous; `opfs-node` retains sync-handle emulation only for its own strict API tests, not for the database engine. `test/harness/aliases.js` redirects module resolution the same way a bundler alias would. Skips live in one file, `test/skip-list.js`, each with its reason; upstream test files are never edited.
 
 ### Running the browser smoke test
 
@@ -97,17 +90,17 @@ npm run build:browser-test
 npx http-server browser-test     # or: python3 -m http.server -d browser-test
 ```
 
-Open the printed `http://localhost` address (OPFS needs a secure context, which localhost is) in Chrome, Firefox and Safari. The page runs `browser-test/smoke.js` in a dedicated worker. It covers OPFS access, reads and writes, snapshots, compaction, suspend/resume, the writer lock, and Hypercore append/read/reopen, and shows each result.
+Open the printed `http://localhost` address (OPFS needs a secure context, which localhost is) in Chrome, Firefox and Safari. The page runs `browser-test/smoke.js` in a worker. It checks asynchronous OPFS write/close/read, snapshots, read-only readers across compaction, damaged-tail recovery, suspend/resume, the writer lock, and Hypercore append/read/reopen, and shows each result.
 
 ## Known limits
 
-- **Every key is held in memory.** Measured with Hypercore, this costs about 1 KB per block retained (native RocksDB: about 15 bytes), and several times that at peak during one very large append. Hypercore's test that appends a million blocks in one batch needs more memory than the 4 GB machine this was built on, so it is skipped. Small and medium cores are fine; very large ones need the planned fix, a persisted on-disk index.
+- **Every key is held in memory.** The index grows with the number of keys; a persisted on-disk index would be needed for very large stores.
 - **Opening replays the log.** Startup time grows with the log size since the last compaction.
-- **Compaction is synchronous and rewrites the whole store.** It blocks the worker while it copies, and the range arguments of `compactRange` are ignored.
-- **Read-only opens across tabs.** A read-only reader in the *same* worker as the writer shares its file handles and works, and is tested. In another tab or worker it can't open files the writer holds, because OPFS locks them exclusively.
-- **Durability.** Writes are flushed once per tick. A crashed tab or browser loses at most the batches since the last flush and never leaves a half-applied batch. Real power-loss behaviour depends on the browser's `flush()`, which can't be tested from here.
-- **Hypercore replication in browsers is blocked by crypto, not storage.** `sodium-javascript` 0.8.0, the latest on npm and what browsers get, lacks `crypto_scalarmult_ed25519_noclamp`. `noise-curve-ed` 2.1.0 needs it for Hypercore's Noise handshake, so the handshake fails. Replication works over this storage in Node. The smoke test detects the missing function and reports replication as skipped, with that reason.
-- **The shim only models what it knows.** Locks are per Node thread (OPFS's are origin-wide); quota and eviction aren't modelled; `getFile()` while a handle is open is refused, to be safe. The real-browser run is the check on all of this.
+- **Compaction rewrites the whole store.** File I/O yields asynchronously, but compaction builds the key/value tree and base in one serialized mutation and can still consume substantial CPU and memory. The range arguments of `compactRange` are ignored.
+- **Read-only opens across tabs.** Read-only opens use immutable `File` snapshots and shared per-log Web Lock leases. They can coexist with a writer, while preventing that writer from deleting log files that the reader might still need. This concurrency path must still be validated in real browsers.
+- **Durability.** The engine awaits `FileSystemWritableFileStream.close()` before acknowledging a batch. Recovery discards incomplete records and uses immutable log/base files. Browser APIs do not provide a universal guarantee that every acknowledged write survives sudden power loss, so durability claims require testing across real browsers and operating systems.
+- **Hypercore replication requires compatible browser crypto.** The smoke test checks the required crypto function and reports replication as skipped if it is unavailable; this is separate from the storage engine. Verify this against the dependency versions actually bundled in your application.
+- **The shim only models what it knows.** Browser quota and eviction aren't modelled, and Node's Web Lock simulation does not coordinate independent Node workers exactly as a browser coordinates same-origin contexts. Real-browser runs remain required.
 
 ## Audit guide
 
@@ -116,7 +109,7 @@ Most of the risk sits in a few places. In suggested reading order:
 1. **`lib/log.js`.** The record format, CRC-32, and `readRecord`, which decides what counts as a valid record. This is what makes a batch all-or-nothing.
 2. **`lib/engine.js`, recovery (`_recover`, `_replayFile`).** Finding the newest complete base, point-in-time replay, and what gets deleted.
 3. **`lib/tree.js`.** Copy-on-write correctness. A node changed in place after creation would silently break snapshots. Every node is built in `makeNode`, and nothing assigns to a node's fields after that.
-4. **`lib/engine.js`, compaction (`_compact`, `_writeBase`, `_unref`).** The switch-over is synchronous, so no write can interleave. Files are deleted only when their last reference goes; this is where the fuzzer found a real bug, since fixed.
+4. **`lib/engine.js`, compaction (`_compact`, `_writeBase`, `_unref`).** Compaction and writes share a serialized mutation queue, so no later mutation can interleave while the base is being committed. Files are retired only after their last in-engine reference goes, and cross-context Web Lock leases prevent deletion while a read-only view may still depend on them.
 5. **`index.js` against `BINDING.md`.** Callback ordering (always a later task) and error paths.
 6. **`opfs-node/index.js`.** Any rule it relaxes compared with real OPFS is a bug the Node tests can't see.
 7. **`test/skip-list.js`.** Every skipped upstream test and its reason.

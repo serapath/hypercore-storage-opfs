@@ -33,35 +33,23 @@ async function logFiles(storePath) {
   return (await listFiles(storePath)).filter((n) => n.endsWith('.log'))
 }
 
-// Opens a file in the store with an exclusive sync access handle, runs fn,
-// closes it. The store must be closed (OPFS allows one handle per file).
-async function withFile(storePath, name, fn) {
-  const fileHandle = await (await dirOf(storePath)).getFileHandle(name)
-  const handle = await fileHandle.createSyncAccessHandle()
-  try {
-    return await fn(handle)
-  } finally {
-    handle.close()
-  }
-}
-
+// Read and replace test files through the async OPFS API. Tests can corrupt
+// records without relying on the sync access handle API that the engine avoids.
 async function readAll(storePath, name) {
-  return withFile(storePath, name, (h) => {
-    const bytes = new Uint8Array(h.getSize())
-    h.read(bytes, { at: 0 })
-    return bytes
-  })
+  const fileHandle = await (await dirOf(storePath)).getFileHandle(name)
+  const file = await fileHandle.getFile()
+  return new Uint8Array(await file.arrayBuffer())
 }
 
 async function writeAll(storePath, name, bytes, { create = false } = {}) {
   const fileHandle = await (await dirOf(storePath)).getFileHandle(name, { create })
-  const handle = await fileHandle.createSyncAccessHandle()
+  const writer = await fileHandle.createWritable()
   try {
-    handle.truncate(0)
-    handle.write(bytes, { at: 0 })
-    handle.flush()
-  } finally {
-    handle.close()
+    await writer.write(bytes)
+    await writer.close()
+  } catch (err) {
+    try { await writer.abort() } catch {}
+    throw err
   }
 }
 
@@ -71,4 +59,4 @@ async function entries(db, range = {}) {
   return out
 }
 
-module.exports = { RocksDB, binding, storePath, dirOf, listFiles, logFiles, withFile, readAll, writeAll, entries }
+module.exports = { RocksDB, binding, storePath, dirOf, listFiles, logFiles, readAll, writeAll, entries }

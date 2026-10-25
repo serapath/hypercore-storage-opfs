@@ -32,7 +32,7 @@ Synchronous. Records the options; opens nothing. Used: `readOnly`, `createIfMiss
 
 Opens or creates the store at `path` (a path under the OPFS root; `/` and `\` separate directories). `columnFamilies` is an array of column family handles; each one gets its id. Missing families are created when `createMissingColumnFamilies` is set and the database is writable, otherwise opening fails with `Column family not found: <name>`. The `default` family always exists.
 
-A writable open takes the store's lock (an exclusive OPFS handle on its `LOCK` file), recovers the log files (see `lib/engine.js`), and writes a fresh random id to `SESSION_ID`. A read-only open takes no lock and changes nothing on disk.
+A writable open takes an origin-scoped exclusive Web Lock for the store path, recovers the log files (see `lib/engine.js`), and writes a fresh random id to `SESSION_ID`. A read-only open takes no writer lock and does not modify files. It acquires shared per-log Web Lock leases for files its views may need. Compaction takes the exclusive side of each file lease before deletion, leaving obsolete files in place when a reader still holds a lease.
 
 `lock` is a file descriptor from fd-lock or device-file in Node, or `-1`. Browsers have no file descriptors, so it is ignored; the store's own lock does that job.
 
@@ -40,15 +40,15 @@ Calls `onopen.call(ctx, err | null)`.
 
 ### `close(db, req, onclose)`
 
-Releases any snapshots still open, flushes, closes every OPFS handle and releases the lock. Calls `onclose.call(req)`. Never fails.
+Releases any snapshots still open, flushes, closes every OPFS handle and releases the lock. Calls `onclose.call(req)`. If cleanup itself fails, the binding still completes the close callback, matching the native binding's non-throwing close contract.
 
 ### `suspend(db, req, onsuspend)` / `resume(db, req, onresume)`
 
-`suspend` flushes, then closes every OPFS handle and releases the lock, keeping everything in memory, so another tab or worker can open the store meanwhile. `resume` takes the lock and handles back. For a writable store it first checks `SESSION_ID`: if another writer has opened the store in the meantime, the in-memory index no longer matches the files, and resume fails with `Session ID does not match` (librocksdb does the same). A failed resume leaves the store suspended. Both call back with `(err | null)` and `req` as `this`.
+`suspend` waits for pending writes, releases its Web Lock and file references, keeping the index in memory, so another writer can open the store meanwhile. `resume` takes the lock and handles back. For a writable store it first checks `SESSION_ID`: if another writer has opened the store in the meantime, the in-memory index no longer matches the files, and resume fails with `Session ID does not match` (librocksdb does the same). A failed resume leaves the store suspended. Both call back with `(err | null)` and `req` as `this`.
 
 ### `flushWal(db, req, onflushwal)` / `flush(db, columnFamily, req, onflush)`
 
-Flush the log file to disk. There is no memtable, so `flush` is the same as `flushWal`. Call back with `(err | null)`.
+Wait for pending mutations to settle. There is no separate memtable flush; `flush` is the same as `flushWal`. Call back with `(err | null)`.
 
 ## Column families
 
@@ -78,9 +78,9 @@ As for reads.
 
 ### `write(db, batch, ops, ctx, onwrite)`
 
-`ops` is an array of `{ type: PUT, key, value, columnFamily }`, `{ type: DELETE, key, columnFamily }` and `{ type: DELETE_RANGE, start, end, columnFamily }`. The batch is applied atomically: encoded as one checksummed log record, appended, then applied in memory. Either the whole batch is visible afterwards, or (on error) none of it. A range delete removes keys `k` with `start <= k < end`; `start == end` is a no-op and `start > end` fails the batch. Calls `onwrite.call(ctx, err | null)`.
+`ops` is an array of `{ type: PUT, key, value, columnFamily }`, `{ type: DELETE, key, columnFamily }` and `{ type: DELETE_RANGE, start, end, columnFamily }`. The batch is applied atomically: encoded as one checksummed record in a new immutable delta file, written with the asynchronous OPFS writable-stream API, and published in memory only after `close()` succeeds. Either the whole batch is visible afterwards, or (on a reported error) none of it. A range delete removes keys `k` with `start <= k < end`; `start == end` is a no-op and `start > end` fails the batch. Calls `onwrite.call(ctx, err | null)` after the write operation settles.
 
-Writes are flushed to disk once per tick rather than once per batch, so a burst of batches costs one flush. `flushWal` forces a flush.
+Each batch is committed by closing its writable stream. `flushWal` is an async barrier that waits for earlier writes to settle; it does not issue a separate synchronous OPFS flush. The browser API's close/commit boundary must not be confused with a universal guarantee against physical power loss.
 
 ### Constants
 
@@ -120,7 +120,7 @@ Releases the references. A log file that compaction replaced is deleted once the
 
 ### `compact(db, columnFamily, exclusive, blobGcPolicy, blobGcAgeCutoff, bottommostLevelCompaction, req, oncompact)`, `compactRange(db, columnFamily, start, end, ...same, req, oncompactrange)`
 
-Rewrite every live entry, in every column family, into a fresh base log file, then switch to it. The range and tuning arguments are ignored: compaction always covers the whole store. Read-only databases fail with `Not supported operation in read only mode.` Call back with `(err | null)`.
+Asynchronously rewrite every live entry, in every column family, into a fresh base log file, commit it by closing the writable stream, then switch to it. The range and tuning arguments are ignored: compaction always covers the whole store. Read-only databases fail with `Not supported operation in read only mode.` Call back with `(err | null)`.
 
 Compaction also runs automatically once the log files hold at least 64 MB and at least twice the live data (configurable; see `configure` below).
 
@@ -142,6 +142,6 @@ Synchronous. Supported names: `rocksdb.estimate-num-keys` (exact key count), `ro
 
 ## Not part of the native binding
 
-### `configure({ autoCompactMinBytes, autoCompactRatio, baseChunkBytes })`
+### `configure({ autoCompactMinBytes, autoCompactRatio, baseChunkBytes, autoCompactMaxLogFiles })`
 
-Tuning for this implementation: when automatic compaction starts (defaults: 64 MB of log, 2× the live data), and the record size compaction writes (1 MB). Mainly for tests.
+Tuning for this implementation: when automatic compaction starts (defaults: 64 MB of log, 2× the live data, or 256 active log files), and the record size compaction writes (1 MB). Mainly for tests.

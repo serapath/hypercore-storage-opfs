@@ -1,22 +1,16 @@
 const test = require('brittle')
 const log = require('../lib/log')
 
-// A minimal in-memory stand-in for a sync access handle, for reading records.
-function memoryHandle(bytes) {
-  return {
-    read(buf, { at }) {
-      const n = Math.max(0, Math.min(buf.byteLength, bytes.byteLength - at))
-      buf.set(bytes.subarray(at, at + n))
-      return n
-    }
-  }
+// File/Blob-backed record parsing keeps the runtime read path asynchronous.
+function blob(bytes) {
+  return new Blob([bytes])
 }
 
 test('crc32 matches the standard check value', (t) => {
   t.is(log.crc32(Buffer.from('123456789')), 0xcbf43926)
 })
 
-test('batch round trip, with value positions', (t) => {
+test('batch round trip, with value positions', async (t) => {
   const ops = [
     { type: log.OP_PUT, cf: 0, key: Buffer.from('k1'), value: Buffer.from('value one') },
     { type: log.OP_DELETE, cf: 3, key: Buffer.from('k2') },
@@ -25,7 +19,7 @@ test('batch round trip, with value positions', (t) => {
     { type: log.OP_PUT, cf: 1, key: Buffer.alloc(0), value: Buffer.alloc(0) }
   ]
   const { record, valueOffsets } = log.encodeBatch(ops)
-  const read = log.readRecord(memoryHandle(record), 0, record.byteLength)
+  const read = await log.readRecord(blob(record), 0, record.byteLength)
   t.ok(read)
   t.is(read.next, record.byteLength)
 
@@ -42,11 +36,11 @@ test('batch round trip, with value positions', (t) => {
   t.is(read.bodyOffset + decoded.ops[0].value.start, valueAt)
 })
 
-test('torn and corrupt records are rejected', (t) => {
+test('torn and corrupt records are rejected', async (t) => {
   const { record } = log.encodeBatch([{ type: log.OP_PUT, cf: 0, key: Buffer.from('key'), value: Buffer.from('value') }])
 
   for (let cut = 0; cut < record.byteLength; cut++) {
-    if (log.readRecord(memoryHandle(record.subarray(0, cut)), 0, cut) !== null) {
+    if (await log.readRecord(blob(record.subarray(0, cut)), 0, cut) !== null) {
       t.fail('accepted a record cut at ' + cut)
       return
     }
@@ -56,7 +50,7 @@ test('torn and corrupt records are rejected', (t) => {
   for (let i = 0; i < record.byteLength; i++) {
     const damaged = record.slice()
     damaged[i] ^= 0x40
-    const read = log.readRecord(memoryHandle(damaged), 0, damaged.byteLength)
+    const read = await log.readRecord(blob(damaged), 0, damaged.byteLength)
     if (read !== null) {
       t.fail('accepted a record with byte ' + i + ' flipped')
       return
@@ -65,22 +59,22 @@ test('torn and corrupt records are rejected', (t) => {
   t.pass('every single-byte flip rejected')
 })
 
-test('header and base end round trip', (t) => {
+test('header and base end round trip', async (t) => {
   const header = log.encodeHeader(log.FILE_BASE)
-  const h = log.decodeBody(log.readRecord(memoryHandle(header), 0, header.byteLength).body)
+  const h = log.decodeBody((await log.readRecord(blob(header), 0, header.byteLength)).body)
   t.is(h.type, log.RECORD_HEADER)
   t.is(h.kind, log.FILE_BASE)
 
   const end = log.encodeBaseEnd(123456)
-  const e = log.decodeBody(log.readRecord(memoryHandle(end), 0, end.byteLength).body)
+  const e = log.decodeBody((await log.readRecord(blob(end), 0, end.byteLength)).body)
   t.is(e.type, log.RECORD_BASE_END)
   t.is(e.count, 123456)
 })
 
-test('large varints survive', (t) => {
+test('large varints survive', async (t) => {
   const big = Buffer.alloc(70000, 1)
   const { record } = log.encodeBatch([{ type: log.OP_PUT, cf: 2 ** 31 + 5, key: Buffer.from('k'), value: big }])
-  const decoded = log.decodeBody(log.readRecord(memoryHandle(record), 0, record.byteLength).body)
+  const decoded = log.decodeBody((await log.readRecord(blob(record), 0, record.byteLength)).body)
   t.is(decoded.ops[0].cf, 2 ** 31 + 5)
   t.is(decoded.ops[0].value.length, 70000)
 })

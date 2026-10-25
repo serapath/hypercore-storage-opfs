@@ -1,5 +1,5 @@
-// Browser smoke test. Runs inside a dedicated Web Worker (OPFS sync access
-// handles only exist there) and reports each check to the page.
+// Browser smoke test. Runs in a Web Worker to exercise the full storage stack.
+// The storage engine itself uses only asynchronous OPFS APIs.
 //
 // It exercises the whole stack: rocksdb-native's JavaScript layer on the OPFS
 // binding, then hypercore-storage, then Hypercore itself (append, read,
@@ -9,6 +9,8 @@ const RocksDB = require('rocksdb-native')
 const Storage = require('hypercore-storage')
 const Hypercore = require('hypercore')
 const sodium = require('sodium-universal')
+const log = require('../lib/log')
+const files_api = require('../lib/files')
 
 const results = []
 
@@ -55,16 +57,17 @@ const base = `/smoke-${run}`
 async function main() {
   report({ type: 'start', userAgent: (globalThis.navigator && navigator.userAgent) || 'unknown' })
 
-  await check('OPFS is available in this worker', async () => {
+  await check('async OPFS write, close and read', async () => {
     assert(globalThis.navigator && navigator.storage && navigator.storage.getDirectory, 'navigator.storage.getDirectory is missing')
     const root = await navigator.storage.getDirectory()
-    const file = await root.getFileHandle(`smoke-probe-${run}`, { create: true })
-    assert(typeof file.createSyncAccessHandle === 'function', 'createSyncAccessHandle is missing (not a dedicated worker?)')
-    const handle = await file.createSyncAccessHandle()
-    handle.write(new Uint8Array([1, 2, 3]), { at: 0 })
-    assert(handle.getSize() === 3, 'write/getSize failed')
-    handle.close()
-    await root.removeEntry(`smoke-probe-${run}`)
+    const name = `smoke-probe-${run}`
+    const file = await root.getFileHandle(name, { create: true })
+    const writer = await file.createWritable()
+    await writer.write(new Uint8Array([1, 2, 3]))
+    await writer.close()
+    const stored = new Uint8Array(await (await file.getFile()).arrayBuffer())
+    assert(stored.join(',') === '1,2,3', 'async write/read returned unexpected bytes: ' + stored)
+    await root.removeEntry(name)
   })
 
   await check('rocksdb-native: write, read, iterate, snapshot, reopen', async () => {
@@ -86,6 +89,156 @@ async function main() {
 
     db = new RocksDB(dir)
     same(await db.get('a'), 'changed', 'value after reopen')
+    await db.close()
+  })
+
+  await check('read-only open waits for an in-flight log commit', async () => {
+    const dir = `${base}/publish-race`
+    const writer = new RocksDB(dir)
+    await writer.ready()
+
+    const original_create_writer = files_api.createWriter
+    let signal_close
+    const close_entered = new Promise((resolve) => { signal_close = resolve })
+    let release_close
+    const close_gate = new Promise((resolve) => { release_close = resolve })
+    let reader = null
+
+    files_api.createWriter = async (shared, options) => {
+      const stream = await original_create_writer(shared, options)
+      return {
+        write: (...args) => stream.write(...args),
+        abort: (...args) => stream.abort(...args),
+        close: async () => {
+          signal_close()
+          await close_gate
+          return stream.close()
+        }
+      }
+    }
+
+    try {
+      const write_pending = writer.put('committed', 'yes')
+      await close_entered
+      reader = new RocksDB(dir, { readOnly: true, createIfMissing: false })
+      let opened = false
+      const opening = reader.ready().then(() => { opened = true })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      assert(!opened, 'read-only open must wait for the in-flight log writer lock')
+
+      release_close()
+      await write_pending
+      await opening
+      same(await reader.get('committed'), 'yes', 'reader sees the whole committed batch')
+    } finally {
+      release_close()
+      files_api.createWriter = original_create_writer
+      if (reader !== null) {
+        try { await reader.ready() } catch {}
+        try { await reader.close() } catch {}
+      }
+      await writer.close()
+    }
+  })
+
+  await check('read-only reader survives compaction using async log leases', async () => {
+    const dir = `${base}/reader-writer`
+    const writer = new RocksDB(dir)
+    await writer.put('a', '1')
+
+    const reader = new RocksDB(dir, { readOnly: true, createIfMissing: false })
+    await reader.ready()
+    await writer.put('b', '2')
+    await writer.compactRange()
+
+    same(await reader.get('a'), '1', 'reader retains its original value')
+    same(await reader.get('b'), null, 'reader does not observe later writes')
+    await reader.close()
+    await writer.close()
+
+    const reopened = new RocksDB(dir)
+    same(await reopened.get('a'), '1', 'compacted value')
+    same(await reopened.get('b'), '2', 'new value after compaction')
+    await reopened.close()
+  })
+
+  await check('failure injection: a rejected async close does not publish a batch', async () => {
+    const dir = `${base}/fault-close`
+    let db = new RocksDB(dir)
+    await db.put('before', 'kept')
+
+    const original_create_writer = files_api.createWriter
+    let fail_close = true
+    files_api.createWriter = async (shared, options) => {
+      const stream = await original_create_writer(shared, options)
+      return {
+        write: (...args) => stream.write(...args),
+        abort: (...args) => stream.abort(...args),
+        close: async () => {
+          if (fail_close) {
+            fail_close = false
+            throw new Error('injected OPFS close failure')
+          }
+          return stream.close()
+        }
+      }
+    }
+
+    try {
+      let rejected = false
+      try {
+        await db.put('uncommitted', 'dropped')
+      } catch (err) {
+        rejected = String(err && err.message).includes('injected OPFS close failure')
+      }
+      assert(rejected, 'injected close failure should reject the write')
+      same(await db.get('before'), 'kept', 'previously committed data remains visible')
+      same(await db.get('uncommitted'), null, 'failed batch is not published')
+    } finally {
+      files_api.createWriter = original_create_writer
+    }
+
+    await db.close()
+    db = new RocksDB(dir)
+    same(await db.get('before'), 'kept', 'previous data survives reopen')
+    same(await db.get('uncommitted'), null, 'failed batch does not return after reopen')
+    await db.close()
+  })
+
+  await check('recovery: a damaged async log tail is not published', async () => {
+    const dir_path = `${base}/fault-tail`
+    let db = new RocksDB(dir_path)
+    await db.put('before', 'kept')
+    await db.put('damaged', 'dropped')
+    await db.close()
+
+    let dir = await navigator.storage.getDirectory()
+    for (const segment of dir_path.split('/').filter(Boolean)) dir = await dir.getDirectoryHandle(segment)
+    const log_names = []
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind === 'file' && /^\d{6,}\.log$/.test(name)) log_names.push(name)
+    }
+    log_names.sort()
+    assert(log_names.length >= 2, 'expected separate immutable log files for committed batches')
+
+    const last = log_names[log_names.length - 1]
+    const handle = await dir.getFileHandle(last)
+    const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer())
+    assert(bytes.byteLength > 1, 'last log has content')
+    const stream = await handle.createWritable()
+    await stream.write(bytes.subarray(0, bytes.byteLength - 1))
+    await stream.close()
+
+    db = new RocksDB(dir_path)
+    same(await db.get('before'), 'kept', 'earlier committed batch survives')
+    same(await db.get('damaged'), null, 'damaged batch is discarded')
+    await db.put('after', 'ok')
+    await db.close()
+
+    db = new RocksDB(dir_path)
+    same(await db.get('before'), 'kept', 'earlier data after another reopen')
+    same(await db.get('after'), 'ok', 'write after recovery survives')
+    same(await db.get('damaged'), null, 'damaged data never reappears')
     await db.close()
   })
 

@@ -160,14 +160,16 @@ function resume(db, req, onresume) {
 }
 
 function flushWal(db, req, onflushwal) {
-  const engine = engineOf(db)
-  let error = null
+  let promise
   try {
-    engine.flushNow()
+    promise = engineOf(db).flushNow()
   } catch (err) {
-    error = err
+    promise = Promise.reject(err)
   }
-  later(() => onflushwal.call(req, error))
+  promise.then(
+    () => later(() => onflushwal.call(req, null)),
+    (err) => later(() => onflushwal.call(req, err))
+  )
   return {}
 }
 
@@ -212,19 +214,25 @@ function read(db, batch, ops, snapshot, asyncIO, fillCache, ctx, onread) {
     errors.fill(err)
   }
 
-  if (engine !== null) {
-    const view = viewOf(snapshot)
-    for (let i = 0; i < ops.length; i++) {
-      const op = ops[i]
-      try {
-        values[i] = engine.get(cfIdOf(op.columnFamily), op.key, view)
-      } catch (err) {
-        errors[i] = err
-      }
-    }
+  if (engine === null) {
+    later(() => onread.call(ctx, errors, values))
+    return
   }
 
-  later(() => onread.call(ctx, errors, values))
+  const view = viewOf(snapshot)
+  Promise.all(ops.map(async (op, i) => {
+    try {
+      values[i] = await engine.get(cfIdOf(op.columnFamily), op.key, view)
+    } catch (err) {
+      errors[i] = err
+    }
+  })).then(
+    () => later(() => onread.call(ctx, errors, values)),
+    (err) => {
+      errors.fill(err)
+      later(() => onread.call(ctx, errors, values))
+    }
+  )
 }
 
 // --- Writes ---------------------------------------------------------------------
@@ -263,7 +271,11 @@ function write(db, batch, ops, ctx, onwrite) {
       }
     }
 
-    engine.write(converted)
+    engine.write(converted).then(
+      () => later(() => onwrite.call(ctx, null)),
+      (err) => later(() => onwrite.call(ctx, err))
+    )
+    return
   } catch (err) {
     error = err
   }
@@ -300,18 +312,18 @@ function iteratorOpen(db, handle, columnFamily, gt, gte, lt, lte, reverse, keysO
 }
 
 function iteratorRead(handle, count) {
-  let error = null
-  let keys = []
-  let values = []
-
+  let promise
   try {
     if (handle.iterator === null) throw makeError('Iterator is not open')
-    ;({ keys, values } = handle.iterator.read(count))
+    promise = handle.iterator.read(count)
   } catch (err) {
-    error = err
+    promise = Promise.reject(err)
   }
 
-  later(() => handle.onread.call(handle.ctx, error, keys, values))
+  promise.then(
+    ({ keys, values }) => later(() => handle.onread.call(handle.ctx, null, keys, values)),
+    (err) => later(() => handle.onread.call(handle.ctx, err, [], []))
+  )
 }
 
 function iteratorClose(handle) {
