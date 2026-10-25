@@ -19,7 +19,8 @@
     "test:fuzz": "node test/run.js fuzz",
     "build:browser-test": "node scripts/build-browser-test.js",
     "test:bundle": "node scripts/build-browser-test.js && node test/bundle.js",
-    "test:hypercore": "node test/run.js hypercore"
+    "test:hypercore": "node test/run.js hypercore",
+    "demo": "budo demo/worker.js:worker.bundle.js --dir demo -- -g ./scripts/browserify-aliases.js --noparse=node_modules/libsodium-sumo/dist/modules-sumo/libsodium-sumo.js"
   },
   "peerDependencies": {
     "rocksdb-native": "3.19.x"
@@ -27,8 +28,11 @@
   "devDependencies": {
     "b4a": "^1.6.7",
     "brittle": "^3.7.0",
+    "browserify": "^17.0.1",
+    "budo": "^11.8.4",
     "buffer": "^6.0.3",
     "compact-encoding": "^3.1.0",
+    "corestore": "^7.15.0",
     "debugging-stream": "^3.1.0",
     "esbuild": "^0.28.2",
     "events": "^3.3.0",
@@ -37,6 +41,7 @@
     "hypercore-crypto": "^3.4.2",
     "hypercore-storage": "3.4.0",
     "hyperswarm": "^4.17.2",
+    "libsodium-wrappers-sumo": "^0.8.4",
     "path-browserify": "^1.0.1",
     "process": "^0.11.10",
     "rache": "^1.0.0",
