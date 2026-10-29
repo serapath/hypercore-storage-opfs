@@ -1,4 +1,4 @@
-// Runs in a dedicated Web Worker, OPFS sync access handles only exist there.
+// Runs in a dedicated Web Worker (index.html) or a SharedWorker (shared.html).
 // Bundled with browserify, see "npm run demo".
 
 // browserify gives every module its own `process` variable but doesn't put it
@@ -8,7 +8,9 @@ globalThis.process = globalThis.process || process
 
 const reset = new URLSearchParams(self.location.search).has('reset')
 
-main().catch((err) => send('not ok', 'crashed', String((err && err.stack) || err)))
+// the same bundle also runs as the SharedWorker of shared.html
+if (typeof SharedWorkerGlobalScope !== 'undefined') require('./shared-worker.js')
+else main().catch((err) => send('not ok', 'crashed', String((err && err.stack) || err)))
 
 async function main() {
   await addNoclamp()
