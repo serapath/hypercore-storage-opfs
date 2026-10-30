@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rocksdb-native-opfs shared worker demo</title>
+<p>One corestore on OPFS in a <code>SharedWorker</code>, used by two iframes at the same time. Each iframe connects on its own, appends a block and reads the block of the other one. Reload the page (or restart the browser): the blocks of the last visit are still there. <a href="?reset">start over</a></p>
+<iframe id="f1" width="45%" height="160"></iframe>
+<iframe id="f2" width="45%" height="160"></iframe>
+<pre id="out"></pre>
+<script>
+  const out = document.getElementById('out')
+  const run = Math.random().toString(16).slice(2, 8)
+  const reset = location.search.includes('reset') ? '&reset' : ''
+  const state = { done: new Set() }
+  window.results = []
+
+  window.onmessage = on_frame_message
+  document.getElementById('f1').src = `frame.html?frame=1&run=${run}${reset}`
+  document.getElementById('f2').src = `frame.html?frame=2&run=${run}${reset}`
+
+  function on_frame_message (event) {
+    const { frame, type, what, error } = event.data
+    if (type === 'done') state.done.add(frame)
+    else add({ type, what: `frame ${frame}: ${what}`, error })
+    if (state.done.size === 2) add({ type: 'done', what: 'reload the page to check the blocks are still there' })
+  }
+
+  function add (result) {
+    window.results.push(result)
+    out.textContent += `${result.type}  ${result.what}${result.error ? '\n' + result.error : ''}\n`
+  }
+</script>

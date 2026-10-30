@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rocksdb-native-opfs shared worker frame</title>
+<pre id="out"></pre>
+<script>
+  // One of the two iframes in shared.html. It connects to the SharedWorker on
+  // its own, appends one block and waits until it can read the other
+  // iframe's block of the same run through the same corestore.
+  const params = new URLSearchParams(location.search)
+  const frame = params.get('frame')
+  const other = frame === '1' ? '2' : '1'
+  const run = params.get('run')
+  const out = document.getElementById('out')
+  const worker = new SharedWorker('worker.bundle.js' + (params.has('reset') ? '?reset' : ''))
+  const state = { pending: new Map(), next_id: 0 }
+
+  worker.port.onmessage = on_reply
+  main().catch(on_crash)
+
+  async function main () {
+    const hello = await ask('hello')
+    send('info', `core ${hello.key.slice(0, 16)}… has ${hello.length} blocks`)
+    if (!params.has('reset')) check(hello.length >= 2, 'blocks from the last visit are still there')
+    const mine = `run-${run}-frame-${frame}`
+    const { index } = await ask('append', mine)
+    check((await ask('get', index)).data === mine, 'reads its own block back')
+    check(await wait_for(`run-${run}-frame-${other}`), 'reads the block of the other iframe')
+    send('done', '')
+  }
+
+  // the other iframe may append before or after this one, so look through
+  // the whole core until its block shows up (20s at most)
+  async function wait_for (data) {
+    for (let i = 0; i < 200; i++) {
+      const { length } = await ask('hello')
+      for (let index = 0; index < length; index++) {
+        if ((await ask('get', index)).data === data) return true
+      }
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    return false
+  }
+
+  function ask (type, data) {
+    const id = state.next_id++
+    return new Promise(wait_reply)
+    function wait_reply (resolve, reject) {
+      state.pending.set(id, msg => msg.type === 'error' ? reject(new Error(msg.error)) : resolve(msg))
+      worker.port.postMessage({ type, id, data })
+    }
+  }
+
+  function on_reply (event) {
+    const msg = event.data
+    if (msg.type === 'not ok') return send('not ok', msg.what, msg.error)
+    const reply = state.pending.get(msg.id)
+    if (!reply) return
+    state.pending.delete(msg.id)
+    reply(msg)
+  }
+
+  function on_crash (err) { send('not ok', 'crashed', String((err && err.stack) || err)) }
+
+  function check (ok, what) { send(ok ? 'ok' : 'not ok', what) }
+
+  function send (type, what, error) {
+    out.textContent += `${type}  ${what}${error ? '\n' + error : ''}\n`
+    parent.postMessage({ frame, type, what, error }, '*')
+  }
+</script>
